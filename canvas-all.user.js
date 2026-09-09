@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Canvas All Info
 // @namespace    https://theusaf.github.io
-// @version      1.4.0
+// @version      1.5.6
 // @icon         https://canvas.instructure.com/favicon.ico
 // @copyright    2020-2021, Daniel Lau
 // @license      MIT
@@ -44,6 +44,79 @@ const log = (str, ...data) => {
   }
   console.log(`[CANVAS-ALL] ${str}`);
 };
+
+/**
+ * delay - waits for the given amount of milliseconds
+ * @param {Number} ms
+ * @returns {Promise<void>}
+ */
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+
+/**
+ * MAX_REQUEST_ATTEMPTS - how many times a request is attempted before giving up
+ * REQUEST_STAGGER_MS - delay between starting each course's requests to avoid rate limiting (HTTP 429)
+ */
+const MAX_REQUEST_ATTEMPTS = 5,
+  REQUEST_STAGGER_MS = 500;
+
+/**
+ * fetchWithRetry - performs a GET request, retrying with backoff when rate
+ * limited (HTTP 429) or when the server errors out
+ * @param {String} url
+ * @param {Number} attempt
+ * @returns {Promise<XMLHttpRequest>}
+ */
+async function fetchWithRetry(url, attempt = 1) {
+  const response = await new Promise((res, rej) => {
+    const x = new XMLHttpRequest();
+    x.open("GET", url);
+    x.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+    x.setRequestHeader(
+      "accept",
+      "application/json+canvas-string-ids, application/json+canvas-string-ids, application/json, text/plain, */*"
+    );
+    x.onerror = () => {
+      rej(new Error(`Network error while requesting ${url}`));
+    };
+    x.onload = () => {
+      res(x);
+    };
+    x.send();
+  });
+  if (
+    (response.status === 429 || response.status >= 500) &&
+    attempt < MAX_REQUEST_ATTEMPTS
+  ) {
+    const retryAfter = parseFloat(response.getResponseHeader("Retry-After")),
+      waitMs =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 1000 * 2 ** (attempt - 1);
+    log(
+      `Request to ${url} failed with status ${
+        response.status
+      }. Retrying in ${waitMs}ms (attempt ${attempt + 1}/${MAX_REQUEST_ATTEMPTS})`
+    );
+    await delay(waitMs);
+    return fetchWithRetry(url, attempt + 1);
+  }
+  return response;
+}
+
+/**
+ * parseJsonResponse - parses a response, failing loudly for non-JSON (error) responses
+ * @param {XMLHttpRequest} response
+ * @returns {Array|Object}
+ */
+function parseJsonResponse(response) {
+  try {
+    return JSON.parse(response.responseText);
+  } catch (e) {
+    throw new Error(
+      `Invalid JSON response (status ${response.status}) from ${response.responseURL}`
+    );
+  }
+}
 
 /**
  * load - Loads everything
@@ -108,6 +181,9 @@ async function load() {
       flex: 25%;
       padding: 0.5rem;
     }
+    #canvasall_main_wrapper>#canvasall_announcement_wrapper.canvasall_collapsed{
+      flex: 0 0 auto;
+    }
     #canvasall_assignment_filter_list_chosen{
       display: inline-block;
     }
@@ -160,10 +236,10 @@ async function load() {
       padding: 0.5rem;
       word-break: break-all;
     }
-    .canvasall_assignment_wrapper:nth-child(2n+1){
+    .canvasall_assignment_wrapper.canvasall_row_odd{
       background: rgba(255,255,255,0.8);
     }
-    .canvasall_assignment_wrapper:nth-child(2n){
+    .canvasall_assignment_wrapper.canvasall_row_even{
       background: rgba(255,255,255,0.4);
     }
     .canvasall_assignment_wrapper{
@@ -186,9 +262,17 @@ async function load() {
       margin-right: 0.5rem;
     }
     .canvasall_assignment_icon {
-      min-height: 1.5rem;
-      min-width: 1.5rem;
+      min-height: 1.75rem;
+      min-width: 1.75rem;
       margin-right: 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .canvasall_assignment_icon::before{
+      display: block;
+      width: 1.25rem;
+      height: 1.25rem;
     }
     .canvasall_assignment_type_assignment:before {
       content: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZlcnNpb249IjEuMSIgeD0iMCIgeT0iMCIgdmlld0JveD0iMCAwIDI4MCAyNTkiIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXcgMCAwIDI4MCAyNTkiIHhtbDpzcGFjZT0icHJlc2VydmUiPjxwYXRoIGQ9Ik03My4zMSwxOThjLTExLjkzLDAtMjIuMjIsOC0yNCwxOC43M2EyNi42NywyNi42NywwLDAsMC0uMywzLjYzdi4zYTIyLDIyLDAsMCwwLDUuNDQsMTQuNjUsMjIuNDcsMjIuNDcsMCwwLDAsMTcuMjIsOEgyMDBWMjI4LjE5aC0xMzRWMjEzLjA4SDIwMFYxOThabTIxLTEwNS43NGg5MC42NFY2Mkg5NC4zWk03OS4xOSwxMDcuMzRWNDYuOTJIMjAwdjYwLjQyWm03LjU1LDMwLjIxVjEyMi40NUgxOTIuNDl2MTUuMTFaTTcxLjY1LDE2LjcxQTIyLjcyLDIyLjcyLDAsMCwwLDQ5LDM5LjM2VjE5MC44OGE0MS4xMiw0MS4xMiwwLDAsMSwyNC4zMi04aDE1N1YxNi43MVpNMzMuODgsMzkuMzZBMzcuNzgsMzcuNzgsMCwwLDEsNzEuNjUsMS42SDI0NS4zNlYxOThIMjE1LjE1djQ1LjMyaDIyLjY2VjI1OC40SDcxLjY1YTM3Ljg1LDM3Ljg1LDAsMCwxLTM3Ljc2LTM3Ljc2WiI+PC9wYXRoPjwvc3ZnPgo=");
@@ -213,15 +297,29 @@ async function load() {
     .canvasall_status_late a{
       color: white;
     }
-    .canvasall_status_missing{
-      background: red !important;
-      color: white;
+    .canvasall_status_missing .canvasall_assignment_icon{
+      background: red;
+      border-radius: 50%;
     }
-    .canvasall_status_missing a{
-      color: white;
+    .canvasall_status_due_today .canvasall_assignment_icon{
+      background: yellow;
+      border-radius: 50%;
     }
     .canvasall_status_feedback>.canvasall_assignment_title::after{
       content: " (Feedback available)"
+    }
+    #canvasall_announcement_wrapper>h3{
+      cursor: pointer;
+      user-select: none;
+    }
+    #canvasall_announcement_wrapper>h3::before{
+      content: "▾ ";
+    }
+    #canvasall_announcement_wrapper.canvasall_collapsed>h3::before{
+      content: "▸ ";
+    }
+    #canvasall_announcement_wrapper.canvasall_collapsed>*:not(h3){
+      display: none;
     }
   </style>
   <span id="canvasall_fetching_information">Fetching information... please wait...</span>
@@ -249,6 +347,7 @@ async function load() {
           <option value="missing">Hide Missing</option>
           <option value="quiz">Hide Quiz</option>
           <option value="assignment">Hide Assignment</option>
+          <option value="noduedate">Hide No Due Date</option>
         </select>
         <div id="canvasall_assignment_filter_list_chosen">
         </div>
@@ -268,7 +367,7 @@ async function load() {
       </div>
     </div>
     <div id="canvasall_announcement_wrapper">
-      <h3>Announcements</h3>
+      <h3 id="canvasall_announcement_toggle" title="Click to collapse or expand announcements">Announcements</h3>
     </div>
   </div>`;
   iFrameLoader.id = "canvas-all-iframe-loader";
@@ -329,6 +428,7 @@ async function load() {
       statusFilterList.append(elem);
       elem.addEventListener("click", click);
       statusFilter.value = "";
+      restripeRows();
     });
     function click() {
       localStorageConfig[value] = false;
@@ -339,6 +439,7 @@ async function load() {
       setTimeout(() => {
         statusFilter.append(elem);
         statusFilter.value = "";
+        restripeRows();
       });
     }
   }
@@ -347,6 +448,42 @@ async function load() {
   statusFilter.addEventListener("change", () => {
     hideType(statusFilter.value);
   });
+
+  // Announcements collapse toggle
+  const announcementsToggle = mainElement.querySelector(
+    "#canvasall_announcement_toggle"
+  );
+  announcementsToggle.addEventListener("click", () => {
+    const collapsed = announcementsDiv.classList.toggle("canvasall_collapsed");
+    localStorageConfig.announcementsCollapsed = collapsed;
+    localStorage.canvasAllConfig = JSON.stringify(localStorageConfig);
+  });
+  if (localStorageConfig.announcementsCollapsed) {
+    announcementsDiv.classList.add("canvasall_collapsed");
+  }
+
+  /**
+   * restripeRows - re-applies alternating row colors to the assignment rows
+   * that are actually visible, since CSS nth-child striping breaks when
+   * rows are hidden by the filters
+   */
+  function restripeRows() {
+    const rows = assignmentsDiv.querySelectorAll(
+      ".canvasall_assignment_wrapper"
+    );
+    let visibleIndex = 0;
+    for (const row of rows) {
+      row.classList.remove("canvasall_row_odd", "canvasall_row_even");
+      if (getComputedStyle(row).display !== "none") {
+        row.classList.add(
+          visibleIndex % 2 === 0
+            ? "canvasall_row_odd"
+            : "canvasall_row_even"
+        );
+        visibleIndex++;
+      }
+    }
+  }
 
   // Begin writing class information
   for (const [i, course] of Object.entries(courses)) {
@@ -371,9 +508,13 @@ async function load() {
 
   log("Getting course assignments and grades");
   let courseCount = 0,
-    finishedCollections = 0;
+    finishedCollections = 0,
+    courseIndex = 0;
   for (const course of courses) {
     courseCount++;
+    // Stagger each course's requests, otherwise Canvas rate limits (HTTP 429)
+    // the burst and entire courses silently lose their assignments
+    delay(courseIndex++ * REQUEST_STAGGER_MS).then(() => {
     getCourseAssignments(course.id, currentUserID).then(assignments => {
       courseAssignments.push.apply(
         courseAssignments,
@@ -395,21 +536,27 @@ async function load() {
         });
 
         log("Compiling assignments");
-        for (const assignment of courseAssignments) {
+        // Render announcements first, newest at the top
+        const announcements = courseAssignments
+          .filter((item) => item.plannable_type === "announcement")
+          .sort(
+            (a, b) =>
+              new Date(b.plannable.created_at).getTime() -
+              new Date(a.plannable.created_at).getTime()
+          );
+        for (const announcement of announcements) {
           const template = document.createElement("template");
-          if (assignment.plannable_type === "announcement") {
-            // Put in announcement thing
-            template.innerHTML = `<div class="canvasall_announcement_wrapper">
+          template.innerHTML = `<div class="canvasall_announcement_wrapper">
                 <div class="canvasall_announcement_title">
-                  <a href="${assignment.html_url}">${assignment.plannable.title}</a>
+                  <a href="${announcement.html_url}">${announcement.plannable.title}</a>
                 </div>
                 <div class="canvasall_announcement_class">
-                  <a href="/courses/${assignment.course_id}">${
-              assignment.context_name
-            }</a>
+                  <a href="/courses/${announcement.course_id}">${
+            announcement.context_name
+          }</a>
                 </div>
                 <div class="canvasall_announcement_when">
-                  <span>${new Date(assignment.plannable.created_at)
+                  <span>${new Date(announcement.plannable.created_at)
                     .toString()
                     .split(" ")
                     .slice(0, 5)
@@ -419,9 +566,13 @@ async function load() {
                     .replace(/\d{4}/, "at")}</span>
                 </div>
               </div>`;
-            announcementsDiv.append(template.content.cloneNode(true));
+          announcementsDiv.append(template.content.cloneNode(true));
+        }
+        for (const assignment of courseAssignments) {
+          if (assignment.plannable_type === "announcement") {
             continue;
           }
+          const template = document.createElement("template");
           const divClasses = [],
             { submissions } = assignment;
           if (submissions) {
@@ -444,6 +595,20 @@ async function load() {
             }
           }
 
+          if (!assignment.plannable.due_at) {
+            // tag for the "Hide No Due Date" filter
+            divClasses.push("canvasall_status_noduedate");
+          } else {
+            const due = new Date(assignment.plannable.due_at),
+              now = new Date();
+            if (
+              due.getFullYear() === now.getFullYear() &&
+              due.getMonth() === now.getMonth() &&
+              due.getDate() === now.getDate()
+            ) {
+              divClasses.push("canvasall_status_due_today");
+            }
+          }
           divClasses.push("canvasall_status_" + assignment.plannable_type);
           template.innerHTML = `<div class="canvasall_assignment_wrapper ${divClasses.join(
             " "
@@ -476,10 +641,15 @@ async function load() {
           </div>`;
           assignmentsDiv.append(template.content.cloneNode(true));
         }
+        restripeRows();
 
         // Restore hide
         for (const [key, value] of Object.entries(localStorageConfig)) {
-          if (value && key !== "") {
+          if (
+            value &&
+            key !== "" &&
+            statusFilter.querySelector(`option[value="${key}"]`)
+          ) {
             hideType(key);
           }
         }
@@ -510,8 +680,8 @@ async function load() {
         const gradeDiv = courseGradeDiv.querySelector(
             `[canvasall-class-id="${course.id}"] > .canvasall_class_grade_score`
           ),
-          { ENV } = w,
-          { grading_scheme } = ENV,
+          { ENV } = w || {},
+          { grading_scheme } = ENV || {},
           [letter] =
             (grading_scheme ?? ["N/A", 0]).find((scheme) => {
               try {
@@ -550,6 +720,7 @@ async function load() {
         );
         teacherDiv.innerHTML = "<span>No instructor found.</span>";
       });
+    });
   }
 }
 
@@ -589,36 +760,22 @@ function getCourses() {
  * @returns {Promise<Array>} The list of assignments
  */
 function getCourseAssignments(courseID, userID) {
-  const x = new XMLHttpRequest(),
-    now = new Date(),
+  const now = new Date(),
     offset = now.getTimezoneOffset() / 60,
     nextUrlRegex = /[^<>]*(?=>; rel="next")/;
-  now.addDays(-14); // To get assignments from 2 weeks ago
+  now.setDate(now.getDate() - 14); // To get assignments from 2 weeks ago
   now.setHours(8 - offset);
   now.setMinutes(0);
   now.setSeconds(0);
   now.setMilliseconds(0);
 
-  function makeHttpRequest(url) {
-    return new Promise((res, rej) => {
-      x.open("GET", url);
-      x.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-      x.setRequestHeader(
-        "accept",
-        "application/json+canvas-string-ids, application/json+canvas-string-ids, application/json, text/plain, */*"
-      );
-      x.onerror = () => {rej();}
-      x.onload = () => {
-        res(x);
-      }
-      x.send();
-    });
-  }
-
   async function gatherRecursiveRequests(url, list = []) {
-    const response = await makeHttpRequest(url),
-      data = JSON.parse(response.responseText),
+    const response = await fetchWithRetry(url),
+      data = parseJsonResponse(response),
       linkHeader = response.getResponseHeader("link");
+    if (!Array.isArray(data)) {
+      throw new Error(`Unexpected response while requesting ${url}`);
+    }
     list.push(...data);
     if (linkHeader) {
       const lastLink = linkHeader.match(nextUrlRegex);
@@ -632,8 +789,13 @@ function getCourseAssignments(courseID, userID) {
     }
   }
 
-  return gatherRecursiveRequests(`/api/v1/planner/items?start_date=${now.toISOString()}&order=asc&context_codes[]=course_${courseID}`) //&context_codes[]=user_${userID}
-    .catch(() => []);
+  return gatherRecursiveRequests(
+    `/api/v1/planner/items?start_date=${now.toISOString()}&order=asc&context_codes[]=course_${courseID}` //&context_codes[]=user_${userID}
+  ).catch((e) => {
+    // do not silently drop a whole course's assignments on failure
+    log(`Failed to get assignments for course ${courseID}`, e);
+    return [];
+  });
 }
 
 /**
@@ -643,24 +805,11 @@ function getCourseAssignments(courseID, userID) {
  * @returns {Object} The teacher
  */
 function getCourseTeacher(courseID) {
-  return new Promise((res, rej) => {
-    const x = new XMLHttpRequest();
-    x.open(
-      "GET",
-      `/api/v1/search/recipients?search=&per_page=20&permissions[]=send_messages_all&messageable_only=true&synthetic_contexts=true&context=course_${courseID}_teachers`
-    );
-    x.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-    x.setRequestHeader(
-      "Accept",
-      "application/json, text/javascript, application/json+canvas-string-ids, */*; q=0.01"
-    );
-    x.onload = () => {
-      res(JSON.parse(x.responseText)[0]);
-    };
-    x.onerror = () => {
-      rej();
-    };
-    x.send();
+  return fetchWithRetry(
+    `/api/v1/search/recipients?search=&per_page=20&permissions[]=send_messages_all&messageable_only=true&synthetic_contexts=true&context=course_${courseID}_teachers`
+  ).then((response) => {
+    const teachers = parseJsonResponse(response);
+    return Array.isArray(teachers) ? teachers[0] : undefined;
   });
 }
 
